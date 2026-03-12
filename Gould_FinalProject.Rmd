@@ -1,0 +1,601 @@
+---
+title: "Used Car Price Prediction"
+subtitle: "PSTAT 131 Final Project"
+author: "Jayden Gould"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 7, out.width = '100%')
+```
+
+## Introduction
+
+The used car market plays a major role in the automotive industry. Whether someone is buying their first car on a budget or a dealership is trying to price its inventory competitively, having an accurate estimate of what a vehicle is worth can make a big difference. Pricing a used car is not straightforward, though. It depends on a combination of factors like the vehicle's age, mileage, brand, engine specifications, accident history, and more. The challenge is figuring out which of these factors matter most and how they interact to determine a car's value.
+
+```{r, echo = FALSE, fig.align = 'center', out.width = '75%'}
+knitr::include_graphics("usedcarimage.jpeg")
+```
+
+The goal of this project is to build a predictive model that can estimate the listed price of a used vehicle based on its attributes. I am working with a dataset of 4,009 used car listings scraped from cars.com, which includes information like brand, model year, mileage, fuel type, engine specs, and accident history. The approach I will take is a regression-based machine learning pipeline. This includes cleaning and exploring the data, engineering useful features, and then fitting and comparing different model types to find the one that predicts price most accurately. I also want to figure out which features have the strongest influence on pricing which means that I will be doing both prediction and inference in this project.
+
+## Loading Packages and Data
+
+The dataset used in this project is the "[Used Car Price Prediction Dataset](https://www.kaggle.com/datasets/taeefnajib/used-car-price-prediction-dataset)" published on Kaggle by Taeef Najib. The data was originally scraped from the popular car marketplace website [cars.com](https://www.cars.com) and contains 4,009 listings with 12 variables describing each vehicle's specifications, history, and listed price.
+
+**Citation:** Najib, T. (2023). *Used Car Price Prediction Dataset*. Kaggle. https://www.kaggle.com/datasets/taeefnajib/used-car-price-prediction-dataset
+
+Here is a preview of the first few rows of the raw dataset:
+
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(janitor)
+library(tidymodels)
+library(corrplot)
+library(ranger)
+library(xgboost)
+library(glmnet)
+library(vip)
+
+set.seed(1738)
+
+used_cars <- read_csv("used_cars.csv")
+
+head(used_cars)
+```
+
+## Codebook
+
+Below is a description of every variable in the dataset. The first 12 variables come directly from the raw data, while `horsepower` and `engine_size` are numeric features I engineered from the `engine` column during data cleaning.
+
+| Variable | Type | Description |
+|:-----------------------|:-----------------------|:-----------------------|
+| `brand` | Categorical | The manufacturer of the vehicle (e.g., Ford, BMW). |
+| `model` | Categorical | The specific model name of the vehicle. |
+| `model_year` | Numeric | The year the vehicle was manufactured. |
+| `milage` | Numeric | The total distance driven by the vehicle in miles (converted from string). |
+| `fuel_type` | Categorical | The primary fuel source (e.g., Gasoline, Hybrid, Diesel). |
+| `engine` | Categorical | Technical specifications of the engine (e.g., horsepower, displacement). |
+| `transmission` | Categorical | The transmission configuration (e.g., Automatic, Manual). |
+| `ext_col` | Categorical | The exterior color of the vehicle. |
+| `int_col` | Categorical | The interior color of the vehicle. |
+| `accident` | Categorical | Accident history reported (e.g., "None reported", "At least 1 accident"). |
+| `clean_title` | Categorical | Indicates if the vehicle has a "Clean" legal title. `NA` values were imputed as "No". |
+| `horsepower` | Numeric | Engine horsepower, extracted from the `engine` string (e.g., 300.0HP → 300). |
+| `engine_size` | Numeric | Engine displacement in liters, extracted from the `engine` string (e.g., 3.7L → 3.7). |
+| `price` | Numeric | The outcome variable. The listed selling price of the vehicle in USD. |
+
+## Data Cleaning and Preprocessing
+
+```{r}
+dim(used_cars)
+```
+
+The raw dataset contains 4,009 observations and 12 variables. Before doing anything else, I want to check for missing values and get a sense of what needs to be cleaned. Below is the count of missing values for each column:
+
+```{r}
+colSums(is.na(used_cars))
+```
+
+There are missing values in three columns: `fuel_type` has 170, `accident` has 113, and `clean_title` has 596. I also noticed a few formatting issues that need to be addressed before analysis. The `price` and `mileage` columns are stored as character strings (e.g., "\$10,300" and "51,000 mi.") and need to be converted to numeric values. The `mileage` column is misspelled as "milage" in the raw data. And the `clean_title` column uses `NA` to represent vehicles without a clean title rather than an explicit "No" value, so I will need to fix those.
+
+```{r}
+used_cars <- used_cars %>% 
+  rename(mileage = milage)
+
+cars_clean <- used_cars %>%
+  clean_names() %>%
+  mutate(price = parse_number(price),
+         mileage = parse_number(mileage)) %>%
+  mutate(
+    clean_title = replace_na(clean_title, "No"),
+    clean_title = factor(clean_title)) %>%
+  drop_na(accident, fuel_type)
+
+print("Rows left so far:")
+dim(cars_clean)
+```
+
+The cleaning pipeline above fixes the column name, parses `price` and `mileage` into numeric values, changes `clean_title` NAs to "No," and drops rows with missing `accident` or `fuel_type`. I chose to drop those rows entirely since both are categorical and there is no reasonable way to impute them. We can't guess whether a car had an accident or what fuel type it uses. This costs us a relatively small number of observations and leaves us with a complete dataset for these key columns.
+
+```{r}
+print("Summary of Price Variable:")
+summary(cars_clean$price)
+```
+
+Additionally, a quick check of the price distribution reveals a handful of extreme values well above \$200,000 with the largest at \$2,954,083. These are most likely data entry errors or very unusual listings. To keep these outliers from distorting our analysis and visualizations, I will filter out any listings priced above \$200,000.
+
+```{r}
+print("Table of Unique Values in Fuel Type Column")
+table(cars_clean$fuel_type)
+```
+
+I also noticed that the `fuel_type` column contains some invalid entries. There are 44 rows where `fuel_type` is recorded as a dash character and 2 rows where it says "not supported." These are not real fuel types, so I will remove them as well.
+
+```{r}
+cars_clean <- cars_clean %>%
+  filter(price <= 200000,
+         !fuel_type %in% c("–", "not supported"))
+```
+
+Here is a summary of the cleaned data and a count of missing values at this point.
+
+```{r}
+glimpse(cars_clean)
+sum(is.na(cars_clean))
+```
+
+We can see that we still have `r nrow(cars_clean)` observations to work with.
+
+### Feature Extraction from Engine Column
+
+The `engine` column contains a lot of useful information packed into a single string. For example, a typical entry looks like "300.0HP 3.7L V6 Cylinder Engine Gasoline Fuel." I want to pull out the two numeric features engine displacement (in liters) and horsepower. These are likely strong predictors of price since larger and more powerful engines tend to be found in more expensive vehicles.
+
+```{r}
+cars_clean <- cars_clean %>%
+  mutate(
+    horsepower = as.numeric(str_extract(engine, "\\d+\\.?\\d*(?=\\s*HP)")),
+    engine_size = as.numeric(str_extract(engine, "\\d+\\.?\\d*(?=\\s*(L|Liter))"))
+  )
+
+cat("Horsepower NAs:", sum(is.na(cars_clean$horsepower)), "\n")
+cat("Engine Size NAs:", sum(is.na(cars_clean$engine_size)), "\n")
+```
+
+Some entries don't follow the standard format (for example, simply listing "V6" with no displacement or HP), so we do end up with some missing values here. I'll leave these as `NA` for now and let the modeling recipe handle imputation later, since dropping them would cost us too many observations.
+
+### Converting Categorical Variables to Factors
+
+For our categorical variables to work properly in modeling, we need to convert them to factors. This tells R to treat them as discrete categories rather than raw text and we can create dummy variables for them later. I am converting `brand`, `fuel_type`, `transmission`, `accident`, `ext_col`, and `int_col` to factor type.
+
+```{r}
+cars_clean <- cars_clean %>%
+  mutate(
+    brand = factor(brand),
+    fuel_type = factor(fuel_type),
+    transmission = factor(transmission),
+    accident = factor(accident),
+    ext_col = factor(ext_col),
+    int_col = factor(int_col)
+  )
+```
+
+### Final Data Check
+
+Here is a final look at the structure of the cleaned dataset before moving on to exploratory data analysis:
+
+```{r}
+glimpse(cars_clean)
+```
+
+After cleaning, we are left with `r nrow(cars_clean)` observations and `r ncol(cars_clean)` variables. The dataset now has properly typed numeric and factor columns, two new engineered features (`horsepower` and `engine_size`), and no missing values in the key categorical columns. We are ready to explore the data.
+
+## Exploratory Data Analysis
+
+Now that the data is cleaned up, I want to explore the relationships between the variables and our outcome, `price`. This will help us understand what factors drive used car prices and inform the types of models we build later on.
+
+### Distribution of Price
+
+First, let's look at the distribution of our outcome variable to understand what we're working with.
+
+```{r, fig.align = 'center'}
+ggplot(cars_clean, aes(x = price)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Distribution of Used Car Prices",
+       x = "Price (USD)",
+       y = "Count") +
+  scale_x_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+The distribution of price is heavily right-skewed, which makes sense since most used cars fall in an affordable range while a smaller number of luxury and exotic vehicles push the tail to the right. The bulk of the listings seem to be priced below \$50,000, with a long tail extending past \$100,000. This skew is something to keep in mind during modeling, as some models may benefit from a log transformation of the response variable.
+
+### Price by Brand (Top 10)
+
+With so many different brands in the dataset, let's focus on the 10 most common ones and compare their price distributions.
+
+```{r, fig.align = 'center', fig.width = 10, fig.height = 6}
+top_brands <- cars_clean %>%
+  count(brand, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(brand)
+
+cars_clean %>%
+  filter(brand %in% top_brands) %>%
+  ggplot(aes(x = reorder(brand, price, FUN = median), y = price)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Price Distribution by Brand (Top 10 Most Common)",
+       x = "Brand",
+       y = "Price (USD)") +
+  scale_y_continuous(labels = scales::comma) +
+  coord_flip() +
+  theme_minimal()
+```
+
+There is a clear difference in pricing across brands. Luxury brands like Porshe and Land Rover tend to have higher median prices compared to more mainstream brands like Ford and Chevrolet. The spread also varies a lot where some brands have fairly tight distributions while others have massive ranges with a lot of high-priced outliers. Brand is very likely going to be an important predictor in our models. One thing worth noting is that "Land" appears as a brand here instead of "Land Rover." This is because the raw data split "Land Rover" across the `brand` and `model` columns, with only "Land" ending up in `brand`. This is a problem with the raw data but does not affect the analysis.
+
+### Mileage vs. Price
+
+Mileage is one of the first things buyers look at when shopping for a used car. Let's see how it relates to price.
+
+```{r, fig.align = 'center', message = FALSE}
+ggplot(cars_clean, aes(x = mileage, y = price)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linewidth = 1) +
+  labs(title = "Mileage vs. Price",
+       x = "Mileage (miles)",
+       y = "Price (USD)") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+As expected, there is a negative relationship between mileage and price. Cars with fewer miles on the odometer tend to command higher prices. The trend line confirms this, though there is a lot of scatter, meaning mileage alone does not fully explain price. There are some high-mileage vehicles that are still relatively expensive, likely luxury or specialty models, and some low-mileage vehicles that are cheaper, probably older or less desirable models.
+
+### Price by Model Year
+
+Let's look at how the model year of a vehicle relates to its price.
+
+```{r, fig.align = 'center', fig.width = 10, fig.height = 6}
+cars_clean %>%
+  filter(model_year >= 2000) %>%
+  ggplot(aes(x = factor(model_year), y = price)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7, outlier.alpha = 0.3) +
+  labs(title = "Price Distribution by Model Year (2000+)",
+       x = "Model Year",
+       y = "Price (USD)") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The general trend is exactly what I expected where newer model years typically have higher prices. There is a particularly steep increase in median price starting around 2018-2019, likely reflecting the fact that newer cars retain more of their original value. The older model years up to the early 2010s have lower median prices. The newer models show more variability than the older models as well, which is likely because older cars have had more time to depreciate and converge toward lower values no matter what they originally sold for, while newer vehicles still reflect a wider range of original MSRPs.
+
+### Correlation Matrix
+
+Now let's look at the correlations between the numeric variables to get a sense of how they relate to each other and to price.
+
+```{r, fig.align = 'center', fig.width = 8, fig.height = 6}
+numeric_vars <- cars_clean %>%
+  select(price, mileage, model_year, horsepower, engine_size) %>%
+  drop_na()
+
+cor_matrix <- cor(numeric_vars)
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.8,
+         tl.col = "black", tl.srt = 45,
+         title = "Correlation Matrix of Numeric Variables",
+         mar = c(0, 0, 2, 0))
+```
+
+We can see that a few correlations stand out here. Horsepower has the strongest positive correlation with price (0.64), which makes sense since more powerful vehicles tend to be higher-end and more expensive. Model year also has a notable positive correlation with price (0.53), reflecting the fact that newer cars cost more. Mileage has a moderate negative correlation with price (-0.58), confirming what we saw in the scatter plot. There is also a strong negative correlation between model year and mileage (-0.59), which also makes sense because newer cars have had less time to drive around and tack on miles. Engine size and horsepower are positively correlated with each other (0.64), which could introduce some multicollinearity, but that's something we can address in the recipe if needed. Engine size itself has a relatively weak correlation with price (0.22), suggesting that displacement alone is less useful than horsepower for predicting price.
+
+### Price by Accident History
+
+Whether or not a car has been in an accident is usually a deal-breaker for used car buyers. Let's see how much of an impact it actually has on price.
+
+```{r, fig.align = 'center'}
+ggplot(cars_clean, aes(x = accident, y = price)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Price by Accident History",
+       x = "Accident History",
+       y = "Price (USD)") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+Vehicles with no reported accidents have a noticeably higher median price compared to those with at least one accident or damage report on record. The spread is also wider for cars with no accidents, which likely reflects the fact that this group makes up a larger share of the dataset and includes more high-end vehicles that have retained their value. In contrast, cars with accident histories tend to cluster at lower prices, since the damage report likely reduces what buyers are willing to pay regardless of the vehicle's other attributes. This confirms that accident history is a useful predictor and that buyers do pay a premium for cars with clean records.
+
+### Price by Fuel Type
+
+Finally, let's look at how fuel type relates to price, especially given the growing interest in electric and hybrid vehicles.
+
+```{r, fig.align = 'center', fig.width = 10, fig.height = 6}
+ggplot(cars_clean, aes(x = reorder(fuel_type, price, FUN = median), y = price)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(title = "Price Distribution by Fuel Type",
+       x = "Fuel Type",
+       y = "Price (USD)") +
+  scale_y_continuous(labels = scales::comma) +
+  coord_flip() +
+  theme_minimal()
+```
+
+We see that hybrid and diesel vehicles usually have higher median prices, which could be because of the fact that these fuel types are more common in newer or more premium vehicles. Gasoline-powered cars have the widest distribution since they make up the majority of listings and span every price range.
+
+## Setting Up for the Models
+
+Now that we have a good understanding of the data, it is time to set up the modeling pipeline. This involves splitting the data into training and testing sets, defining a preprocessing recipe, and setting up cross-validation folds.
+
+### Data Splitting
+
+I will split the data into 75% training and 25% testing, stratified on `price`. Stratifying on the outcome variable ensures that both the training and testing sets have a similar distribution of prices, which is especially important given the skewed nature of our response variable.
+
+Before splitting, I need to select the variables I plan to use as predictors. I am dropping `model`, `engine`, `ext_col`, and `int_col` from the modeling data. The `model` column has hundreds of unique values which would create far too many dummy variables. The `engine` column is the raw string we already extracted `horsepower` and `engine_size` from, so it is redundant. And `ext_col` and `int_col` (exterior and interior color) have many unique levels and are unlikely to be strong predictors of price.
+
+```{r}
+cars_model <- cars_clean %>%
+  select(price, brand, model_year, mileage, fuel_type, transmission,
+         accident, clean_title, horsepower, engine_size)
+
+cars_split <- initial_split(cars_model, prop = 0.75, strata = price)
+cars_train <- training(cars_split)
+cars_test <- testing(cars_split)
+
+cat("Training set:", nrow(cars_train), "observations\n")
+cat("Testing set:", nrow(cars_test), "observations\n")
+```
+
+### Recipe
+
+The recipe defines how we preprocess the data before feeding it into our models. I am including the following steps:
+
+- Impute missing values in `horsepower` and `engine_size` using the median of each column, since we cannot drop these rows without losing too many observations.
+- Collapse rare factor levels in `brand` and `transmission` using `step_other()`, which groups infrequent categories into an "other" level. This prevents issues with dummy encoding when rare brands appear in only one of the train/test sets.
+- Dummy encode all categorical predictors so they can be used in models that require numeric input.
+- Remove any zero-variance predictors that may result from the dummy encoding.
+- Center and scale all predictors, which is required for regularized models like elastic net and usually helpful for others.
+
+```{r}
+cars_recipe <- recipe(price ~ ., data = cars_train) %>%
+  step_impute_median(horsepower, engine_size) %>%
+  step_other(brand, transmission, threshold = 0.02) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+cars_recipe
+```
+
+### K-Fold Cross-Validation
+
+I will use 10-fold cross-validation on the training set, stratified on `price` which once again makes sure that each fold will have a similar price distribution to the full training set. This gives us a reliable estimate of model performance while making efficient use of our training data.
+
+```{r}
+cars_folds <- vfold_cv(cars_train, v = 10, strata = price)
+```
+
+## Model Building
+
+With the recipe and cross-validation folds defined, I can now specify, tune, and fit each model. I am fitting four different model types. They are linear regression, elastic net, random forest, and boosted trees. For models with tunable hyperparameters, I will use `grid_regular()` to create a grid of values and select the best combination based on cross-validated RMSE.
+
+### Linear Regression
+
+Linear regression is a good baseline model. It has no tuning parameters, so I just need to fit it using cross-validation to get a performance estimate.
+
+```{r, cache = TRUE}
+lm_spec <- linear_reg() %>%
+  set_engine("lm") %>%
+  set_mode("regression")
+
+lm_wf <- workflow() %>%
+  add_recipe(cars_recipe) %>%
+  add_model(lm_spec)
+
+lm_fit <- lm_wf %>%
+  fit_resamples(resamples = cars_folds,
+                control = control_resamples(save_pred = TRUE))
+
+collect_metrics(lm_fit)
+```
+
+The linear regression model gives us a baseline RMSE of about \$18,803, meaning that on average the model's predictions are off by roughly \$18,800. The R-squared of 0.598 tells us the model explains about 60% of the variance in price, which is decent but the other models should definitely be able to do better.
+
+### Elastic Net
+
+Elastic net is a regularized regression model that combines the penalties of lasso (L1) and ridge (L2) regression. It has two tuning parameters. They are `penalty` (the overall strength of regularization) and `mixture` (the balance between L1 and L2). A `mixture` of 1 is pure lasso and 0 is pure ridge.
+
+```{r}
+en_spec <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression")
+
+en_wf <- workflow() %>%
+  add_recipe(cars_recipe) %>%
+  add_model(en_spec)
+
+en_grid <- grid_regular(
+  penalty(range = c(-4, 0)),
+  mixture(range = c(0, 1)),
+  levels = 10
+)
+```
+
+Below are the results of tuning the elastic net model across the hyperparameter grid:
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+en_tune <- en_wf %>%
+  tune_grid(resamples = cars_folds,
+            grid = en_grid,
+            control = control_grid(save_pred = TRUE))
+
+autoplot(en_tune)
+```
+
+```{r}
+show_best(en_tune, metric = "rmse")
+```
+
+Looking at the autoplot, the RMSE and R-squared values are remarkably flat across nearly all penalty and mixture combinations, indicating that the elastic net's performance basically doesn''t change with the tuning parameters here. The one exception is pure ridge regression (mixture = 0), which performs slightly worse with a higher RMSE than the other mixture values. The show_best() output confirms this. All five top configurations share a mixture of 0.111, meaning a slight lean toward ridge with a small lasso component, and their RMSE values are identical at 18,802. Overall, the elastic net did not meaningfully improve over plain linear regression (RMSE of 18,803), which suggests that regularization offers little benefit for this particular set of predictors after our recipe preprocessing has already handled zero-variance removal and scaling.
+
+### Random Forest
+
+Random forests are an ensemble method that builds many decision trees and averages their predictions. They tend to perform well on a wide range of problems and are robust to outliers and nonlinear relationships. The key tuning parameters are `mtry` (the number of predictors randomly sampled at each split), `trees` (the number of trees in the forest), and `min_n` (the minimum number of observations in a terminal node).
+
+```{r}
+rf_spec <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("regression")
+
+rf_wf <- workflow() %>%
+  add_recipe(cars_recipe) %>%
+  add_model(rf_spec)
+
+rf_grid <- grid_regular(
+  mtry(range = c(2, 8)),
+  trees(range = c(200, 1000)),
+  min_n(range = c(5, 20)),
+  levels = 5
+)
+```
+
+This gives us a grid of `r nrow(rf_grid)` hyperparameter combinations to try. Below are the results of tuning the random forest model across this grid:
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE}
+rf_tune <- rf_wf %>%
+  tune_grid(resamples = cars_folds,
+            grid = rf_grid,
+            control = control_grid(save_pred = TRUE))
+
+autoplot(rf_tune) +
+  theme(strip.text = element_text(size = 7))
+```
+
+```{r}
+show_best(rf_tune, metric = "rmse")
+```
+
+The autoplot shows us that performance improves greatly as the number of randomly selected predictors (mtry) increases, with RMSE dropping sharply from around \$19,000 at mtry = 2 down to roughly \$13,000 at mtry = 8. The number of trees has relatively little impact as the different colored lines are pretty close together at each mtry value. Similarly, smaller minimum node sizes tend to perform slightly better, with the lower min_n facets showing the lowest RMSE values. The show_best() output confirms this with all five top configurations using mtry = 8 and min_n = 5, with the best achieving an RMSE of 13,161. This is a major improvement over the linear models, cutting the RMSE by almost \$6,000.
+
+### Boosted Trees
+
+Boosted trees, or gradient boosting, build trees sequentially, with each new tree trying to correct the errors of the previous ones. This approach often produces very accurate models. The tuning parameters are `mtry`, `trees`, `min_n`, and `learn_rate` (which controls how much each new tree contributes to the ensemble).
+
+```{r}
+bt_spec <- boost_tree(mtry = tune(), trees = tune(),
+                      min_n = tune(), learn_rate = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+bt_wf <- workflow() %>%
+  add_recipe(cars_recipe) %>%
+  add_model(bt_spec)
+
+bt_grid <- grid_regular(
+  mtry(range = c(2, 8)),
+  trees(range = c(200, 1000)),
+  min_n(range = c(5, 20)),
+  learn_rate(range = c(-3, -1)),
+  levels = 4
+)
+
+bt_grid
+```
+
+This grid has `r nrow(bt_grid)` combinations. Below are the results of tuning the boosted tree model across this grid:
+
+```{r, message = FALSE, warning = FALSE, cache = TRUE, fig.width=14, fig.height=8}
+bt_tune <- bt_wf %>%
+  tune_grid(resamples = cars_folds,
+            grid = bt_grid,
+            control = control_grid(save_pred = TRUE))
+
+autoplot(bt_tune) +
+  theme(strip.text = element_text(size = 5))
+```
+
+```{r}
+show_best(bt_tune, metric = "rmse")
+```
+
+The boosted tree autoplot shows that both the learning rate and the number of randomly selected predictors have a strong effect on performance. Lower learning rates perform poorly regardless of other settings, with RMSE values above \$20,000, because the model does not learn enough from each tree. As the learning rate increases, performance improves a lot, with the best results appearing at a learning rate of 0.0215. The number of trees also matters more at moderate learning rates because more trees give the model additional iterations to correct its errors. Like random forest, higher mtry values consistently lead to lower RMSE. The show_best() output confirms that the best configuration uses mtry = 8, 1000 trees, min_n = 5, and a learning rate of 0.0215, achieving a cross-validated RMSE of \$11,881. This is the best performance of any model tested so far, beating the random forest by almost \$1,300.
+
+## Model Results
+
+Now that all four models have been fit, let's compare their best cross-validated performance side by side. I will pull the best RMSE and R-squared from each model and put them in a table so we can see which model performed best on the training data.
+
+```{r}
+lm_rmse <- collect_metrics(lm_fit) %>% filter(.metric == "rmse")
+lm_rsq <- collect_metrics(lm_fit) %>% filter(.metric == "rsq")
+en_rmse <- show_best(en_tune, metric = "rmse", n = 1)
+en_rsq <- show_best(en_tune, metric = "rsq", n = 1)
+rf_rmse <- show_best(rf_tune, metric = "rmse", n = 1)
+rf_rsq <- show_best(rf_tune, metric = "rsq", n = 1)
+bt_rmse <- show_best(bt_tune, metric = "rmse", n = 1)
+bt_rsq <- show_best(bt_tune, metric = "rsq", n = 1)
+
+model_comparison <- tibble(
+  Model = c("Linear Regression", "Elastic Net", "Random Forest", "Boosted Trees"),
+  CV_RMSE = c(lm_rmse$mean, en_rmse$mean, rf_rmse$mean, bt_rmse$mean),
+  CV_R_Squared = c(lm_rsq$mean, en_rsq$mean, rf_rsq$mean, bt_rsq$mean)
+) %>%
+  arrange(CV_RMSE)
+
+model_comparison
+```
+
+The comparison table confirms what we saw during individual tuning with the two tree-based models outperforming the linear approaches. The boosted tree model leads with a cross-validated RMSE of about \$11,881 and an R-squared of 0.837, meaning it explains roughly 84% of the variance in price. The random forest is close behind at \$13,161 RMSE and 0.811 R-squared. The linear regression and elastic net are essentially tied at around \$18,800 RMSE and 0.598 R-squared. The gap between the linear and tree-based models is quite large, which suggests that the nonlinear relationships and interactions we observed in the EDA (for example, the interactions between brand, mileage, and model year) are important for predicting price and are better captured by the tree methods. I will now take the top two models (boosted trees and random forest) and evaluate them on the test set to see how well they generalize to unseen data.
+
+## Results of the Best Models
+
+Based on the cross-validation results, I will finalize the best-performing models by fitting them with their optimal hyperparameters on the full training set, then evaluating them on the test set.
+
+```{r, cache = TRUE}
+best_rf_params <- select_best(rf_tune, metric = "rmse")
+final_rf_wf <- rf_wf %>% finalize_workflow(best_rf_params)
+
+best_bt_params <- select_best(bt_tune, metric = "rmse")
+final_bt_wf <- bt_wf %>% finalize_workflow(best_bt_params)
+
+final_rf_fit <- final_rf_wf %>% last_fit(cars_split)
+final_bt_fit <- final_bt_wf %>% last_fit(cars_split)
+
+cat("Random Forest Test Metrics:\n")
+collect_metrics(final_rf_fit)
+
+cat("\nBoosted Trees Test Metrics:\n")
+collect_metrics(final_bt_fit)
+```
+
+Both models generalized well to the test set, with performance close to their cross-validation estimates. The boosted tree model achieved a test RMSE of approximately \$12,383 and an R-squared of 0.834, while the random forest got a \$13,626 RMSE and 0.807 R-squared. The fact that these numbers are close to the cross-validated results (\$11,881 and \$13,161 respectively) suggests that neither model is overfitting to the training data. The boosted tree model still performs better on unseen data and confirms that it is the best model for this task.
+
+### Predicted vs. Actual Price
+
+Let's visualize how well the boosted tree model's predictions match the actual test set prices:
+
+```{r, fig.align = 'center'}
+best_preds <- collect_predictions(final_bt_fit)
+
+ggplot(best_preds, aes(x = price, y = .pred)) +
+  geom_point(alpha = 0.4, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  labs(title = "Predicted vs. Actual Price (Boosted Trees)",
+       x = "Actual Price (USD)",
+       y = "Predicted Price (USD)") +
+  scale_x_continuous(labels = scales::comma) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal()
+```
+
+The model performs well for cars priced below roughly \$50,000, where the points cluster tightly around the red line. As prices increase beyond that, the predictions become less accurate and more scattered. The model tends to predict low for the most expensive vehicles, with several points in the \$150,000–\$200,000 range being predicted closer to \$100,000 or below. This is not surprising given that high-priced listings are relatively rare in the dataset, so the model has less data to learn from in that range. There are also a few notable outliers where the model misses badly, such as a car actually priced near \$200,000 that was predicted around \$60,000. Despite these struggles towards the upper end, the overall pattern tracks the diagonal well, which is consistent with the R-squared of 0.834 we observed on the test set.
+
+### Variable Importance
+
+Finally, let's look at which variables the boosted tree model relied on most heavily when making predictions:
+
+```{r, fig.align = 'center', message = FALSE, warning = FALSE}
+final_bt_fit %>%
+  extract_fit_engine() %>%
+  vip(num_features = 15) +
+  labs(title = "Variable Importance (Boosted Trees)") +
+  theme_minimal()
+```
+
+Mileage is by far the most important predictor, followed closely by horsepower and model year. These three numeric features make up much of the plot and are what mainly gives the model its predictive power. This lines up with what we saw in the EDA, where mileage had the strongest negative correlation with price and horsepower had the strongest positive correlation. Engine size comes in fourth and we can see that while it still contributes meaningfully, it is noticeably less than the top three. After that, there is a sharp drop-off to the brand-level features, with Porsche standing out as the most important individual brand which makes sense because Porsche vehicles are usually very highly priced and can help the model separate expensive cars from the rest. The remaining brand dummies, transmission dummies, and categorical features like accident history and clean title all contribute a small amount.
+
+## Conclusion
+
+The goal of this project was to build a model that could accurately predict the price of a used vehicle based on its specifications and history. After cleaning and exploring a dataset of over 4,000 used car listings from cars.com, I fit and compared four different model types which were linear regression, elastic net, random forest, and boosted trees.
+
+Through exploratory data analysis, I found that model year, mileage, brand, horsepower, and accident history all had clear relationships with price. Newer cars with fewer miles and no accident history tended to be priced higher, and luxury brands were usually priced at a premium over mainstream ones. These patterns carried through into the modeling results, as the variable importance plot confirmed that mileage, horsepower, and model year were the three most influential predictors.
+
+Among the four models, the boosted tree model performed the best overall with a test RMSE of approximately \$12,383 and an R-squared of 0.834, meaning it explains about 83% of the variance in price. The random forest was not far behind at \$13,626 RMSE and 0.807 R-squared. Both tree-based models greatly outperformed the linear regression and elastic net, which were essentially tied at around \$18,800 RMSE. This gap makes sense given the nonlinear relationships and interactions we saw in the EDA that the linear models were unable to capture. It is also worth noting that the boosted tree's test performance was very close to its cross-validation estimate of \$11,881, which suggests the model is not overfitting and should generalize well to new data.
+
+There is still room for improvement. The model struggles more with higher-priced vehicles where there is less training data and more variability in the listings. Future work could explore additional features like geographic location, seller type, or more descriptive model information. A larger dataset would also help, especially for the upper end of the price distribution. Overall though, this project shows that used car prices can be predicted with reasonable accuracy using vehicle specifications and history alone.

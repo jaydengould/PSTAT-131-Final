@@ -1,0 +1,16 @@
+| Variable | Type | Description |
+|:-----------------------|:-----------------------|:-----------------------|
+| `brand` | Categorical | The manufacturer of the vehicle (e.g., Ford, BMW). |
+| `model` | Categorical | The specific model name of the vehicle. |
+| `model_year` | Numeric | The year the vehicle was manufactured. |
+| `milage` | Numeric | The total distance driven by the vehicle in miles (converted from string). |
+| `fuel_type` | Categorical | The primary fuel source (e.g., Gasoline, Hybrid, Diesel). |
+| `engine` | Categorical | Technical specifications of the engine (e.g., horsepower, displacement). |
+| `transmission` | Categorical | The transmission configuration (e.g., Automatic, Manual). |
+| `ext_col` | Categorical | The exterior color of the vehicle. |
+| `int_col` | Categorical | The interior color of the vehicle. |
+| `accident` | Categorical | Accident history reported (e.g., "None reported", "At least 1 accident"). |
+| `clean_title` | Categorical | Indicates if the vehicle has a "Clean" legal title. `NA` values were imputed as "No". |
+| `horsepower` | Numeric | Engine horsepower, extracted from the `engine` string (e.g., 300.0HP → 300). |
+| `engine_size` | Numeric | Engine displacement in liters, extracted from the `engine` string (e.g., 3.7L → 3.7). |
+| `price` | Numeric | The outcome variable. The listed selling price of the vehicle in USD. |
